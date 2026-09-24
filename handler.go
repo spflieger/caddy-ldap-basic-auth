@@ -129,7 +129,14 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		return nil
 	}
-	defer m.putConn(l)
+	discardConn := false
+	defer func() {
+		if discardConn {
+			l.Close()
+		} else {
+			m.putConn(l)
+		}
+	}()
 
 	userDN := fmt.Sprintf("%s=%s,%s", m.UserAttr, ldap.EscapeDN(username), m.BaseDN)
 	err = l.Bind(userDN, password)
@@ -141,6 +148,7 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			w.WriteHeader(http.StatusUnauthorized)
 		} else {
 			logger.Error("LDAP bind failed", zap.String("user", username), zap.Error(err))
+			discardConn = true
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 
@@ -163,6 +171,7 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		groupResult, groupErr := l.Search(groupSearch)
 		if groupErr != nil {
 			logger.Error("LDAP group search error", zap.String("user", username), zap.Error(groupErr))
+			discardConn = true
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return nil
 		}

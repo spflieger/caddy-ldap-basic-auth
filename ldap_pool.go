@@ -20,15 +20,26 @@ func (m *LDAPBasicAuth) initPool() {
 }
 
 func (m *LDAPBasicAuth) newConn() (*ldap.Conn, error) {
+	timeout, err := m.requestTimeout()
+	if err != nil {
+		return nil, err
+	}
+	var conn *ldap.Conn
 	if m.UseLDAPS {
 		serverName := strings.Split(m.LDAPServer, ":")[0]
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: m.InsecureSkipVerify,
 			ServerName:         serverName,
 		}
-		return ldap.DialTLS("tcp", m.LDAPServer, tlsConfig)
+		conn, err = ldap.DialTLS("tcp", m.LDAPServer, tlsConfig)
+	} else {
+		conn, err = ldap.Dial("tcp", m.LDAPServer)
 	}
-	return ldap.Dial("tcp", m.LDAPServer)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetTimeout(timeout)
+	return conn, nil
 }
 
 func (m *LDAPBasicAuth) getConn() (*ldap.Conn, error) {

@@ -47,6 +47,7 @@ route {
         use_ldaps
         insecure_skip_verify        # Optional, only for self-signed certs
         pool_size                   5
+        ldap_request_timeout        10s
         rate_limit_max_attempts     5
         rate_limit_window_seconds   60
         rate_limit_lockout_seconds  300
@@ -67,6 +68,7 @@ route {
 | `use_ldaps`               | flag     | No       | Use LDAPS (LDAP over TLS). (default: `false`) |
 | `insecure_skip_verify`    | flag     | No       | Skip TLS verification (not recommended for production). (default: `false`) |
 | `pool_size`               | int      | No       | LDAP connection pool size (default: `5`)
+| `ldap_request_timeout`    | duration | No       | Timeout for LDAP bind and search requests, from `1s` to `5m` (default: `10s`). |
 | `rate_limit_max_attempts`  | int      | No       | Rate limiting: max attempts (default: `5`) |
 | `rate_limit_window_seconds`  | int      | No       | Rate limiting: window in seconds (default: `60`) |
 | `rate_limit_lockout_seconds`  | int      | No       | Rate limiting: lockout in seconds (default: `300`) |
