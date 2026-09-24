@@ -1,24 +1,24 @@
 package ldapbasicauth
 
 import (
-    "encoding/base64"
-    "fmt"
-    "math/rand"
-    "net/http"
-    "strings"
-    "time"
+	"encoding/base64"
+	"fmt"
+	"math/rand"
 	"net"
+	"net/http"
+	"strings"
+	"time"
 
-    "github.com/caddyserver/caddy/v2"
-    "github.com/caddyserver/caddy/v2/modules/caddyhttp"
-    "github.com/go-ldap/ldap/v3"
-    "go.uber.org/zap"
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/go-ldap/ldap/v3"
+	"go.uber.org/zap"
 )
 
 var clientIPHeaders = []string{
-    "CF-Connecting-IP",
-    "X-Forwarded-For",
-    "X-Real-IP",
+	"CF-Connecting-IP",
+	"X-Forwarded-For",
+	"X-Real-IP",
 }
 
 func getClientIP(r *http.Request) string {
@@ -54,14 +54,14 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return nil
 	}
 
-    if locked, until := m.checkRateLimit(remote_addr); locked {
+	if locked, until := m.checkRateLimit(remote_addr); locked {
 		logger.Warn("Too many failed attempts, IP is temporarily locked", zap.String("remote_addr", remote_addr), zap.Time("locked_until", until))
 
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(until.Sub(time.Now()).Seconds())))
 		w.WriteHeader(http.StatusTooManyRequests)
 
-        return nil
-    }
+		return nil
+	}
 
 	payload, perr := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
 	if perr != nil {
@@ -82,6 +82,12 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return nil
 	}
 	username, password := pair[0], pair[1]
+	if password == "" {
+		logger.Warn("Empty password", zap.String("user", username), zap.String("remote_addr", remote_addr))
+		w.WriteHeader(http.StatusUnauthorized)
+		m.registerFailedAttempt(remote_addr)
+		return nil
+	}
 	if strings.ContainsAny(username, ",=+<>#;\"\\") || strings.TrimSpace(username) != username || strings.ContainsAny(username, " \t\r\n") {
 		logger.Warn("Username contains invalid/suspicious or whitespace characters", zap.String("user", username), zap.String("remote_addr", remote_addr))
 
@@ -112,16 +118,14 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	if err != nil {
 		logger.Error("LDAP connection failed", zap.String("user", username), zap.Error(err))
 
-		w.WriteHeader(http.StatusUnauthorized)
-		m.registerFailedAttempt(remote_addr)
+		w.WriteHeader(http.StatusServiceUnavailable)
 
 		return nil
 	}
 	if l == nil {
 		logger.Error("LDAP connection returned nil")
 
-		w.WriteHeader(http.StatusUnauthorized)
-		m.registerFailedAttempt(remote_addr)
+		w.WriteHeader(http.StatusServiceUnavailable)
 
 		return nil
 	}
@@ -130,11 +134,15 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	userDN := fmt.Sprintf("%s=%s,%s", m.UserAttr, ldap.EscapeDN(username), m.BaseDN)
 	err = l.Bind(userDN, password)
 	if err != nil {
-		logger.Warn("LDAP bind failed", zap.String("user", username), zap.Error(err))
-		m.registerFailedAttempt(remote_addr)
-
-		time.Sleep(time.Duration(100+rand.Intn(200)) * time.Millisecond)
-		w.WriteHeader(http.StatusUnauthorized)
+		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+			logger.Warn("LDAP bind rejected credentials", zap.String("user", username), zap.Error(err))
+			m.registerFailedAttempt(remote_addr)
+			time.Sleep(time.Duration(100+rand.Intn(200)) * time.Millisecond)
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			logger.Error("LDAP bind failed", zap.String("user", username), zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 
 		return nil
 	}
@@ -154,14 +162,16 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		)
 		groupResult, groupErr := l.Search(groupSearch)
 		if groupErr != nil {
-			logger.Warn("LDAP group search error", zap.String("user", username), zap.Error(groupErr))
+			logger.Error("LDAP group search error", zap.String("user", username), zap.Error(groupErr))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return nil
 		}
 		entryCount := 0
 		if groupResult != nil {
 			entryCount = len(groupResult.Entries)
 		}
 		logger.Debug("LDAP group search result", zap.Int("entry_count", entryCount))
-		if groupErr != nil || entryCount == 0 {
+		if entryCount == 0 {
 			logger.Info("User is not a member of group", zap.String("user", username), zap.String("group", m.GroupMembershipDN), zap.String("filter", groupFilter))
 			// Add a small random delay to mitigate timing attacks
 			time.Sleep(time.Duration(100+rand.Intn(200)) * time.Millisecond)
