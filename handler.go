@@ -139,7 +139,40 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}()
 
 	userDN := fmt.Sprintf("%s=%s,%s", m.UserAttr, ldap.EscapeDN(username), m.BaseDN)
-	err = l.Bind(userDN, password)
+	if m.LDAPBindDN != "" {
+		search := ldap.NewSearchRequest(
+			m.BaseDN,
+			ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 2, 0, false,
+			fmt.Sprintf("(%s=%s)", m.UserAttr, ldap.EscapeFilter(username)),
+			[]string{"dn"},
+			nil,
+		)
+		result, searchErr := l.Search(search)
+		if searchErr != nil {
+			logger.Error("LDAP user search failed", zap.String("user", username), zap.Error(searchErr))
+			discardConn = true
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return nil
+		}
+		if result == nil || len(result.Entries) != 1 {
+			logger.Warn("LDAP user search did not return exactly one account", zap.String("user", username), zap.Int("matches", entryCount(result)))
+			m.registerFailedAttempt(remote_addr)
+			w.WriteHeader(http.StatusUnauthorized)
+			return nil
+		}
+		userDN = result.Entries[0].DN
+	}
+	authConn := l
+	if m.LDAPBindDN != "" {
+		authConn, err = m.newConn()
+		if err != nil {
+			logger.Error("LDAP authentication connection failed", zap.String("user", username), zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return nil
+		}
+		defer authConn.Close()
+	}
+	err = authConn.Bind(userDN, password)
 	if err != nil {
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
 			logger.Warn("LDAP bind rejected credentials", zap.String("user", username), zap.Error(err))
@@ -148,7 +181,6 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			w.WriteHeader(http.StatusUnauthorized)
 		} else {
 			logger.Error("LDAP bind failed", zap.String("user", username), zap.Error(err))
-			discardConn = true
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 
@@ -160,9 +192,9 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// Check group membership
 	if m.GroupMembershipDN != "" {
 		groupFilter := fmt.Sprintf("(%s=%s)", m.GroupMembershipAttr, ldap.EscapeFilter(userDN))
-		logger.Debug("Preparing LDAP group membership search", zap.String("base", m.BaseDN), zap.String("filter", groupFilter), zap.String("userDN", userDN))
+		logger.Debug("Preparing LDAP group membership search", zap.String("base", m.GroupMembershipDN), zap.String("filter", groupFilter), zap.String("userDN", userDN))
 		groupSearch := ldap.NewSearchRequest(
-			m.BaseDN,
+			m.GroupMembershipDN,
 			ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 0, false,
 			groupFilter,
 			[]string{"dn"},
@@ -195,7 +227,14 @@ func (m *LDAPBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	logger.Info("Authentication successful", zap.String("user", username), zap.String("remote_addr", remote_addr))
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	repl.Set("ldap.basicauth.username", username)
+	repl.Set("http.auth.user.id", username)
 
 	return next.ServeHTTP(w, r)
+}
+
+func entryCount(result *ldap.SearchResult) int {
+	if result == nil {
+		return 0
+	}
+	return len(result.Entries)
 }

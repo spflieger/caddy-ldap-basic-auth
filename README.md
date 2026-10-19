@@ -42,6 +42,9 @@ route {
         ldap_server                 "ldap.example.com:636"
         base_dn                     "ou=users,dc=example,dc=com"
         user_attr                   "uid"
+        # For AD lookups, use a read-only account to search for the user's DN.
+        ldap_bind_dn                "CN=ldap-reader,OU=Service Accounts,DC=example,DC=com"
+        ldap_bind_password          "{$LDAP_BIND_PASSWORD}"
         group_membership_dn         "cn=admins,ou=groups,dc=example,dc=com"
         group_membership_attr       "member"
         use_ldaps
@@ -63,6 +66,8 @@ route {
 | `ldap_server`             | string   | Yes      | Host:port of your LDAP/LDAPS server. |
 | `base_dn`                 | string   | Yes      | Base DN for user search (e.g., `ou=users,dc=example,dc=com`). |
 | `user_attr`               | string   | Yes      | Attribute for username (e.g., `uid` or `sAMAccountName`). |
+| `ldap_bind_dn`             | string   | No       | Bind DN for searching users by `user_attr`; configure together with `ldap_bind_password`. Required by directories, including typical AD setups, that do not allow anonymous searches. |
+| `ldap_bind_password`       | string   | No       | Password for the read-only search account. In production, supply it through a Caddy environment placeholder such as `{$LDAP_BIND_PASSWORD}`. |
 | `group_membership_dn`     | string   | No       | DN of the group to require membership in. |
 | `group_membership_attr`   | string   | No       | Attribute for group membership (default: `member`). |
 | `use_ldaps`               | flag     | No       | Use LDAPS (LDAP over TLS). (default: `false`) |
@@ -73,8 +78,10 @@ route {
 | `rate_limit_window_seconds`  | int      | No       | Rate limiting: window in seconds (default: `60`) |
 | `rate_limit_lockout_seconds`  | int      | No       | Rate limiting: lockout in seconds (default: `300`) |
 
+When `ldap_bind_dn` is configured, pooled connections stay bound as that search account and are used only for user and group searches. Password verification uses a separate short-lived LDAP connection, so it cannot change the identity of a pooled search connection.
+
 ### Variables
-After succesful authentication, the variable `ldap.basicauth.username` is set to the authenticated user. This variable can be used in, for example: paths when using webdav `/var/www/{ldap.basicauth.username}/data`.
+After successful authentication, the Caddy placeholder `{http.auth.user.id}` contains the authenticated username. For example, it can be used in a WebDAV path such as `/var/www/{http.auth.user.id}/data`.
 
 ## Logging
 
@@ -108,12 +115,13 @@ logging {
             group_membership_dn    "cn=admins,ou=groups,dc=example,dc=com"
             use_ldaps
         }
-        respond "Welcome, {ldap.basicauth.username}!"
+        respond "Welcome, {http.auth.user.id}!"
     }
 }
 ```
 
 ## Troubleshooting
+- For Active Directory, set `user_attr "sAMAccountName"`, use the domain naming context (for example `DC=medes,DC=internal`) as `base_dn`, and configure a read-only search account with `ldap_bind_dn` and `ldap_bind_password`. The plugin searches for the account DN, then binds as that user to verify the password.
 - Check Caddy logs for authentication and LDAP errors.
 - Use `insecure_skip_verify` only for testing with self-signed certificates.
 - Ensure your LDAP server is reachable from the Caddy host.

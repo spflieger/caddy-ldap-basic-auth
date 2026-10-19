@@ -18,6 +18,8 @@ type LDAPBasicAuth struct {
 	LDAPServer          string `json:"ldap_server"`
 	BaseDN              string `json:"base_dn"`
 	UserAttr            string `json:"user_attr"`
+	LDAPBindDN          string `json:"ldap_bind_dn,omitempty"`
+	LDAPBindPassword    string `json:"ldap_bind_password,omitempty"`
 	GroupMembershipDN   string `json:"group_membership_dn"`
 	GroupMembershipAttr string `json:"group_membership_attr,omitempty"`
 	UseLDAPS            bool   `json:"use_ldaps,omitempty"`
@@ -57,6 +59,16 @@ func (m *LDAPBasicAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.UserAttr = d.Val()
+			case "ldap_bind_dn":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.LDAPBindDN = d.Val()
+			case "ldap_bind_password":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.LDAPBindPassword = d.Val()
 			case "group_membership_dn":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -133,6 +145,9 @@ func (m *LDAPBasicAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 	if m.GroupMembershipAttr == "" {
 		m.GroupMembershipAttr = "member"
+	}
+	if (m.LDAPBindDN == "") != (m.LDAPBindPassword == "") {
+		return d.Err("ldap_bind_dn and ldap_bind_password must be configured together")
 	}
 	if m.PoolSize == 0 {
 		m.PoolSize = 5
