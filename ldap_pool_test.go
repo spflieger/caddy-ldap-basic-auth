@@ -365,6 +365,10 @@ type testLDAPServer struct {
 	binds           map[string]int
 	searchAttribute string
 	searchValue     string
+	searchBindDN    string
+	bindResults     map[string]uint16
+	searchEntries   map[string]int
+	searchResults   map[string]uint16
 }
 
 func newTestLDAPServer(t *testing.T, allowAnonymous bool, userDN string) *testLDAPServer {
@@ -414,8 +418,11 @@ func (s *testLDAPServer) serveConn(conn net.Conn) {
 			} else {
 				s.mu.Lock()
 				s.binds[dn]++
+				resultCode = int(s.bindResults[dn])
 				s.mu.Unlock()
-				boundDN = dn
+				if resultCode == ldap.LDAPResultSuccess {
+					boundDN = dn
+				}
 			}
 			bind := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationBindResponse, nil, "bind response")
 			bind.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, resultCode, "result code"))
@@ -424,6 +431,15 @@ func (s *testLDAPServer) serveConn(conn net.Conn) {
 			response.AppendChild(bind)
 		case ldap.ApplicationSearchRequest:
 			s.searches.Add(1)
+			baseDN, _ := operation.Children[0].Value.(string)
+			s.mu.Lock()
+			s.searchBindDN = boundDN
+			entries, configured := s.searchEntries[baseDN]
+			if !configured {
+				entries = 1
+			}
+			resultCode := s.searchResults[baseDN]
+			s.mu.Unlock()
 			if len(operation.Children) > 6 {
 				filter := operation.Children[6]
 				if filter.Tag == 3 && len(filter.Children) == 2 {
@@ -436,17 +452,23 @@ func (s *testLDAPServer) serveConn(conn net.Conn) {
 			if boundDN == "" {
 				return
 			}
-			entry := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationSearchResultEntry, nil, "search entry")
-			entry.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, s.userDN, "object name"))
-			entry.AppendChild(ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "attributes"))
-			response.AppendChild(entry)
-			if _, err := conn.Write(response.Bytes()); err != nil {
-				return
+			if resultCode == ldap.LDAPResultSuccess {
+				for i := 0; i < entries; i++ {
+					entryResponse := ber.NewSequence("LDAP search entry")
+					entryResponse.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "message ID"))
+					entry := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationSearchResultEntry, nil, "search entry")
+					entry.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, s.userDN, "object name"))
+					entry.AppendChild(ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "attributes"))
+					entryResponse.AppendChild(entry)
+					if _, err := conn.Write(entryResponse.Bytes()); err != nil {
+						return
+					}
+				}
 			}
 			response = ber.NewSequence("LDAP search result")
 			response.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "message ID"))
 			done := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationSearchResultDone, nil, "search done")
-			done.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, ldap.LDAPResultSuccess, "result code"))
+			done.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, resultCode, "result code"))
 			done.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matched DN"))
 			done.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "diagnostic message"))
 			response.AppendChild(done)
