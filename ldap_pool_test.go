@@ -1,7 +1,6 @@
 package ldapbasicauth
 
 import (
-	"context"
 	"encoding/base64"
 	"net"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/caddyserver/caddy/v2"
 	ber "github.com/go-asn1-ber/asn1-ber"
 	"github.com/go-ldap/ldap/v3"
 )
@@ -249,9 +247,8 @@ func TestAuthenticationPoolModes(t *testing.T) {
 				m.LDAPBindDN = "CN=ldap-reader,OU=Service,DC=example,DC=com"
 				m.LDAPBindPassword = "reader-password"
 			}
-			next := testHandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
 			for i := 0; i < 2; i++ {
-				if status := authenticateTestRequest(t, m, next); status != http.StatusOK {
+				if status := authenticateTestRequest(t, m); status != http.StatusOK {
 					t.Fatalf("request %d status = %d, want 200", i+1, status)
 				}
 			}
@@ -283,34 +280,91 @@ func TestAuthenticationPoolModes(t *testing.T) {
 	}
 }
 
-type testHandlerFunc func(http.ResponseWriter, *http.Request) error
-
-func (f testHandlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
-	return f(w, r)
+func TestUnicodeAndPunctuationUsernameInDirectBindDN(t *testing.T) {
+	username := "Jöhn,Ops+1"
+	baseDN := "DC=example,DC=com"
+	wantDN := `sAMAccountName=Jöhn\,Ops\+1,` + baseDN
+	if _, err := ldap.ParseDN(wantDN); err != nil {
+		t.Fatalf("expected escaped DN to parse: %v", err)
+	}
+	server := newTestLDAPServer(t, false, wantDN)
+	m := &LDAPBasicAuth{
+		LDAPServer:              server.listener.Addr().String(),
+		BaseDN:                  baseDN,
+		UserAttr:                "sAMAccountName",
+		PoolSize:                1,
+		RateLimitMaxAttempts:    5,
+		RateLimitWindowSeconds:  60,
+		RateLimitLockoutSeconds: 60,
+	}
+	user, authenticated, err := authenticateWithUsername(t, m, "192.0.2.21", username, "password")
+	if err != nil || !authenticated {
+		t.Fatalf("authenticated = %t, error = %v; want successful authentication", authenticated, err)
+	}
+	if user.ID != username {
+		t.Fatalf("user ID = %q, want %q", user.ID, username)
+	}
+	if got := server.countBind(wantDN); got != 1 {
+		t.Fatalf("binds using escaped DN %q = %d, want 1", wantDN, got)
+	}
 }
 
-func authenticateTestRequest(t *testing.T, m *LDAPBasicAuth, next testHandlerFunc) int {
+func TestUnicodeAndPunctuationUsernameInSearchFilter(t *testing.T) {
+	username := "Jöhn*(Ops)\\1"
+	userDN := "CN=Jöhn,OU=Users,DC=example,DC=com"
+	server := newTestLDAPServer(t, false, userDN)
+	m := &LDAPBasicAuth{
+		LDAPServer:              server.listener.Addr().String(),
+		BaseDN:                  "DC=example,DC=com",
+		UserAttr:                "sAMAccountName",
+		LDAPBindDN:              "CN=reader,DC=example,DC=com",
+		LDAPBindPassword:        "reader-password",
+		PoolSize:                1,
+		RateLimitMaxAttempts:    5,
+		RateLimitWindowSeconds:  60,
+		RateLimitLockoutSeconds: 60,
+	}
+	_, authenticated, err := authenticateWithUsername(t, m, "192.0.2.22", username, "password")
+	if err != nil || !authenticated {
+		t.Fatalf("authenticated = %t, error = %v; want successful authentication", authenticated, err)
+	}
+	server.mu.Lock()
+	gotAttribute, gotValue := server.searchAttribute, server.searchValue
+	server.mu.Unlock()
+	if gotAttribute != "sAMAccountName" || gotValue != username {
+		t.Fatalf("LDAP search assertion = (%q=%q), want (%q=%q)", gotAttribute, gotValue, "sAMAccountName", username)
+	}
+}
+
+func authenticateTestRequest(t *testing.T, m *LDAPBasicAuth) int {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 	request.RemoteAddr = net.JoinHostPort("192.0.2.20", "12345")
 	request.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("alice:password")))
-	request = request.WithContext(context.WithValue(request.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
-	response := httptest.NewRecorder()
-	if err := m.ServeHTTP(response, request, next); err != nil {
+	user, authenticated, err := m.Authenticate(httptest.NewRecorder(), prepareTestRequest(request))
+	if err != nil {
 		t.Fatal(err)
 	}
-	return response.Code
+	if !authenticated {
+		return http.StatusUnauthorized
+	}
+	if user.ID != "alice" {
+		t.Fatalf("authenticated user ID = %q, want alice", user.ID)
+	}
+	return http.StatusOK
 }
 
 type testLDAPServer struct {
-	listener       net.Listener
-	allowAnonymous bool
-	userDN         string
-	accepted       atomic.Int32
-	anonymousBinds atomic.Int32
-	searches       atomic.Int32
-	mu             sync.Mutex
-	binds          map[string]int
+	listener        net.Listener
+	allowAnonymous  bool
+	userDN          string
+	accepted        atomic.Int32
+	anonymousBinds  atomic.Int32
+	searches        atomic.Int32
+	mu              sync.Mutex
+	binds           map[string]int
+	searchAttribute string
+	searchValue     string
 }
 
 func newTestLDAPServer(t *testing.T, allowAnonymous bool, userDN string) *testLDAPServer {
@@ -370,6 +424,15 @@ func (s *testLDAPServer) serveConn(conn net.Conn) {
 			response.AppendChild(bind)
 		case ldap.ApplicationSearchRequest:
 			s.searches.Add(1)
+			if len(operation.Children) > 6 {
+				filter := operation.Children[6]
+				if filter.Tag == 3 && len(filter.Children) == 2 {
+					s.mu.Lock()
+					s.searchAttribute, _ = filter.Children[0].Value.(string)
+					s.searchValue, _ = filter.Children[1].Value.(string)
+					s.mu.Unlock()
+				}
+			}
 			if boundDN == "" {
 				return
 			}

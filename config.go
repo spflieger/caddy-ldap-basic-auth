@@ -2,9 +2,12 @@ package ldapbasicauth
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/go-ldap/ldap/v3"
 )
@@ -16,6 +19,7 @@ const (
 
 type LDAPBasicAuth struct {
 	LDAPServer          string `json:"ldap_server"`
+	Realm               string `json:"realm,omitempty"`
 	BaseDN              string `json:"base_dn"`
 	UserAttr            string `json:"user_attr"`
 	LDAPBindDN          string `json:"ldap_bind_dn,omitempty"`
@@ -43,42 +47,24 @@ func (m *LDAPBasicAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			return d.ArgErr()
 		}
 		for d.NextBlock(0) {
+			var err error
 			switch d.Val() {
+			case "realm":
+				m.Realm, err = singleArgument(d)
 			case "ldap_server":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.LDAPServer = d.Val()
+				m.LDAPServer, err = singleArgument(d)
 			case "base_dn":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.BaseDN = d.Val()
+				m.BaseDN, err = singleArgument(d)
 			case "user_attr":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.UserAttr = d.Val()
+				m.UserAttr, err = singleArgument(d)
 			case "ldap_bind_dn":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.LDAPBindDN = d.Val()
+				m.LDAPBindDN, err = singleArgument(d)
 			case "ldap_bind_password":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.LDAPBindPassword = d.Val()
+				m.LDAPBindPassword, err = singleArgument(d)
 			case "group_membership_dn":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.GroupMembershipDN = d.Val()
+				m.GroupMembershipDN, err = singleArgument(d)
 			case "group_membership_attr":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.GroupMembershipAttr = d.Val()
+				m.GroupMembershipAttr, err = singleArgument(d)
 			case "use_ldaps":
 				if d.NextArg() {
 					return d.ArgErr()
@@ -90,64 +76,60 @@ func (m *LDAPBasicAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				m.InsecureSkipVerify = true
 			case "pool_size":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var size int
-				_, err := fmt.Sscanf(d.Val(), "%d", &size)
-				if err != nil || size < 1 {
-					return d.Errf("invalid pool_size value: %s", d.Val())
-				}
-				m.PoolSize = size
+				m.PoolSize, err = positiveIntArgument(d)
 			case "ldap_request_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				m.LDAPRequestTimeout = d.Val()
-				if _, err := m.requestTimeout(); err != nil {
-					return d.Errf("%v", err)
+				m.LDAPRequestTimeout, err = singleArgument(d)
+				if err == nil {
+					if _, timeoutErr := m.requestTimeout(); timeoutErr != nil {
+						err = d.Errf("%v", timeoutErr)
+					}
 				}
 			case "rate_limit_max_attempts":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				_, err := fmt.Sscanf(d.Val(), "%d", &v)
-				if err != nil || v < 1 {
-					return d.Errf("invalid rate_limit_max_attempts: %s", d.Val())
-				}
-				m.RateLimitMaxAttempts = v
+				m.RateLimitMaxAttempts, err = positiveIntArgument(d)
 			case "rate_limit_window_seconds":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				_, err := fmt.Sscanf(d.Val(), "%d", &v)
-				if err != nil || v < 1 {
-					return d.Errf("invalid rate_limit_window_seconds: %s", d.Val())
-				}
-				m.RateLimitWindowSeconds = v
+				m.RateLimitWindowSeconds, err = positiveIntArgument(d)
 			case "rate_limit_lockout_seconds":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				_, err := fmt.Sscanf(d.Val(), "%d", &v)
-				if err != nil || v < 1 {
-					return d.Errf("invalid rate_limit_lockout_seconds: %s", d.Val())
-				}
-				m.RateLimitLockoutSeconds = v
+				m.RateLimitLockoutSeconds, err = positiveIntArgument(d)
 			default:
 				return d.Errf("unrecognized subdirective '%s'", d.Val())
+			}
+			if err != nil {
+				return err
 			}
 		}
 	}
 
+	m.applyDefaults()
+	return nil
+}
+
+func singleArgument(d *caddyfile.Dispenser) (string, error) {
+	var value string
+	if !d.AllArgs(&value) {
+		return "", d.ArgErr()
+	}
+	return value, nil
+}
+
+func positiveIntArgument(d *caddyfile.Dispenser) (int, error) {
+	directive := d.Val()
+	value, err := singleArgument(d)
+	if err != nil {
+		return 0, err
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil || number < 1 {
+		return 0, d.Errf("%s must be a positive integer, got %q", directive, value)
+	}
+	return number, nil
+}
+
+func (m *LDAPBasicAuth) applyDefaults() {
+	if m.Realm == "" {
+		m.Realm = "restricted"
+	}
 	if m.GroupMembershipAttr == "" {
 		m.GroupMembershipAttr = "member"
-	}
-	if (m.LDAPBindDN == "") != (m.LDAPBindPassword == "") {
-		return d.Err("ldap_bind_dn and ldap_bind_password must be configured together")
 	}
 	if m.PoolSize == 0 {
 		m.PoolSize = 5
@@ -161,8 +143,132 @@ func (m *LDAPBasicAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if m.RateLimitLockoutSeconds == 0 {
 		m.RateLimitLockoutSeconds = 300
 	}
+}
 
+func (m *LDAPBasicAuth) Provision(caddy.Context) error {
+	m.applyDefaults()
 	return nil
+}
+
+func (m *LDAPBasicAuth) Validate() error {
+	if strings.ContainsAny(m.Realm, "\r\n") {
+		return fmt.Errorf("realm cannot contain carriage returns or newlines")
+	}
+	if m.LDAPServer == "" {
+		return fmt.Errorf("ldap_server is required")
+	}
+	if m.BaseDN == "" {
+		return fmt.Errorf("base_dn is required")
+	}
+	if _, err := ldap.ParseDN(m.BaseDN); err != nil {
+		return fmt.Errorf("base_dn is not a valid LDAP distinguished name: %w", err)
+	}
+	if m.UserAttr == "" {
+		return fmt.Errorf("user_attr is required")
+	}
+	if !validLDAPAttributeType(m.UserAttr) {
+		return fmt.Errorf("user_attr must be a valid LDAP attribute type (RFC 4512 / RFC 4514): %q", m.UserAttr)
+	}
+	if m.GroupMembershipDN != "" {
+		if _, err := ldap.ParseDN(m.GroupMembershipDN); err != nil {
+			return fmt.Errorf("group_membership_dn is not a valid LDAP distinguished name: %w", err)
+		}
+	}
+	if !validLDAPAttributeDescription(m.GroupMembershipAttr) {
+		return fmt.Errorf("group_membership_attr must be a valid LDAP attribute description (RFC 4512): %q", m.GroupMembershipAttr)
+	}
+	if (m.LDAPBindDN == "") != (m.LDAPBindPassword == "") {
+		return fmt.Errorf("ldap_bind_dn and ldap_bind_password must be configured together")
+	}
+	if m.LDAPBindDN != "" {
+		if _, err := ldap.ParseDN(m.LDAPBindDN); err != nil {
+			return fmt.Errorf("ldap_bind_dn is not a valid LDAP distinguished name: %w", err)
+		}
+	}
+	if m.PoolSize < 1 || m.RateLimitMaxAttempts < 1 || m.RateLimitWindowSeconds < 1 || m.RateLimitLockoutSeconds < 1 {
+		return fmt.Errorf("pool_size and rate limit values must be positive")
+	}
+	_, err := m.requestTimeout()
+	return err
+}
+
+func validLDAPAttributeType(value string) bool {
+	if isLDAPKeyString(value) {
+		return true
+	}
+	return isLDAPNumericOID(value)
+}
+
+func validLDAPAttributeDescription(value string) bool {
+	parts := strings.Split(value, ";")
+	if !validLDAPAttributeType(parts[0]) {
+		return false
+	}
+	for _, option := range parts[1:] {
+		if option == "" {
+			return false
+		}
+		for _, r := range option {
+			if !isLDAPKeyChar(r) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isLDAPNumericOID(value string) bool {
+	arcs := strings.Split(value, ".")
+	if len(arcs) < 2 {
+		return false
+	}
+	for _, arc := range arcs {
+		if arc == "" || (len(arc) > 1 && arc[0] == '0') {
+			return false
+		}
+		for _, r := range arc {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isLDAPKeyString(value string) bool {
+	if value == "" || !isLDAPAlpha(rune(value[0])) {
+		return false
+	}
+	for _, r := range value[1:] {
+		if !isLDAPKeyChar(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isLDAPKeyChar(r rune) bool {
+	return isLDAPAlpha(r) || (r >= '0' && r <= '9') || r == '-'
+}
+
+func isLDAPAlpha(r rune) bool {
+	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
+}
+
+func (m *LDAPBasicAuth) Cleanup() error {
+	if m.pool == nil {
+		return nil
+	}
+	for {
+		select {
+		case conn := <-m.pool:
+			if conn != nil {
+				conn.Close()
+			}
+		default:
+			return nil
+		}
+	}
 }
 
 func (m *LDAPBasicAuth) requestTimeout() (time.Duration, error) {

@@ -1,6 +1,6 @@
 # Caddy LDAP Basic Auth Plugin
 
-This plugin provides HTTP Basic Authentication for Caddy v2 using an LDAP server for credential validation and group membership checks.
+This plugin provides a Caddy `caddyauth.Authenticator` provider for HTTP Basic Authentication, using an LDAP server for credential validation and optional group membership checks.
 
 ## Features
 - Authenticate users against an LDAP/LDAPS server
@@ -34,12 +34,13 @@ caddy add-package github.com/bluewalk/caddy-ldap-basic-auth
 
 ## Configuration
 
-Add the `ldap_basic_auth` directive to your Caddyfile:
+Add the `ldap_basic_auth` directive to your Caddyfile. It configures Caddy's shared authentication handler with the LDAP provider:
 
 ```
 route {
     ldap_basic_auth {
         ldap_server                 "ldap.example.com:636"
+        realm                       "Restricted"
         base_dn                     "ou=users,dc=example,dc=com"
         user_attr                   "uid"
         # For AD lookups, use a read-only account to search for the user's DN.
@@ -55,7 +56,7 @@ route {
         rate_limit_window_seconds   60
         rate_limit_lockout_seconds  300
     }
-    respond "Hello, {http.auth.user}!"
+    respond "Hello, {http.auth.user.id}!"
 }
 ```
 
@@ -64,6 +65,7 @@ route {
 | Option                    | Type     | Required | Description                                                                                   |
 |---------------------------|----------|----------|-----------------------------------------------------------------------------------------------|
 | `ldap_server`             | string   | Yes      | Host:port of your LDAP/LDAPS server. |
+| `realm`                   | string   | No       | Basic authentication realm shown in the `WWW-Authenticate` challenge (default: `restricted`). |
 | `base_dn`                 | string   | Yes      | Base DN for user search (e.g., `ou=users,dc=example,dc=com`). |
 | `user_attr`               | string   | Yes      | Attribute for username (e.g., `uid` or `sAMAccountName`). |
 | `ldap_bind_dn`             | string   | No       | Bind DN for searching users by `user_attr`; configure together with `ldap_bind_password`. Required by directories, including typical AD setups, that do not allow anonymous searches. |
@@ -80,12 +82,20 @@ route {
 
 When `ldap_bind_dn` is configured, pooled connections stay bound as that search account and are used only for user and group searches. Password verification uses a separate short-lived LDAP connection, so it cannot change the identity of a pooled search connection.
 
+Rate limiting and authentication logs use Caddy's resolved client IP. Behind a reverse proxy, configure Caddy's `trusted_proxies` and `client_ip_headers` as appropriate; the plugin does not read forwarding headers itself. If Caddy's resolved client IP is missing or empty, the provider returns an error.
+
 ### Variables
 After successful authentication, the Caddy placeholder `{http.auth.user.id}` contains the authenticated username. For example, it can be used in a WebDAV path such as `/var/www/{http.auth.user.id}/data`.
 
+The provider is registered as `http.authentication.providers.ldap`. In JSON, add its configuration under the `providers.ldap` member of an `authentication` handler. The Caddyfile directive above is the simpler equivalent when LDAP is the only provider.
+
+The authentication handler returns HTTP 401 when no provider authenticates the request. LDAP connection, search, and lockout errors are returned to Caddy as provider errors and are available in `{http.auth.ldap.error}` for `handle_errors` customization. The LDAP provider does not write response status codes directly.
+
+When multiple providers are configured under one authentication handler, they are alternatives: a request is authenticated if any provider accepts it. Add only providers that should independently grant access.
+
 ## Logging
 
-This plugin uses Caddy's structured logging. You can control log levels and output in your Caddyfile:
+This plugin uses Caddy's structured logging under the `ldap_basic_auth` logger name. You can control log levels and output in your Caddyfile:
 
 ```
 logging {
@@ -110,6 +120,7 @@ logging {
     route {
         ldap_basic_auth {
             ldap_server            "ldap.example.com:636"
+            realm                  "Restricted"
             base_dn                "ou=users,dc=example,dc=com"
             user_attr              "uid"
             group_membership_dn    "cn=admins,ou=groups,dc=example,dc=com"
@@ -121,6 +132,8 @@ logging {
 ```
 
 ## Troubleshooting
+- Caddyfile users can use the `ldap_basic_auth` handler directive shown above. In JSON, the provider module name is `http.authentication.providers.ldap` and it must be nested under an `authentication` handler.
+- The `authentication` handler normally returns 401 for rejected credentials and provider errors. Use `handle_errors` and `{http.auth.ldap.error}` if backend failures or rate limits need a different response status.
 - For Active Directory, set `user_attr "sAMAccountName"`, use the domain naming context (for example `DC=medes,DC=internal`) as `base_dn`, and configure a read-only search account with `ldap_bind_dn` and `ldap_bind_password`. The plugin searches for the account DN, then binds as that user to verify the password.
 - Check Caddy logs for authentication and LDAP errors.
 - Use `insecure_skip_verify` only for testing with self-signed certificates.
